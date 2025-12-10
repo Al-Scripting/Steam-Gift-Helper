@@ -181,96 +181,130 @@ const App = () => {
 
   // --- LOGIC ---
 
-  const handleSearch = async (e) => {
-  e.preventDefault();
-  setLoading(true);
-  setError(null);
-  setUserData(null);
+  const handleSearch = async (e, directQuery = null) => {
+    if (e) e.preventDefault();
+    const activeQuery = directQuery || searchQuery;
+    setLoading(true);
+    setError(null);
+    setUserData(null);
+    
+    // 1. USE DIRECT VALUE IF AVAILABLE
+    console.log("Searching for:", activeQuery); // <--- LOOK FOR THIS IN CONSOLE
 
-  try {
-    // This connects to the server you have running on port 5000
-    const response = await fetch(`http://localhost:5000/api/search/${searchQuery}`);
-    const data = await response.json();
+    setLoading(true);
+    setError(null);
+    setUserData(null);
 
-    if (!response.ok) throw new Error(data.error || 'Failed to fetch data');
+    // 2. CHECK MOCK DATA
+    const lowerQuery = activeQuery.toLowerCase().trim();
+    if (MOCK_USERS[lowerQuery]) {
+      setTimeout(() => {
+        setUserData(MOCK_USERS[lowerQuery]);
+        setLoading(false);
+      }, 500);
+      return; 
+    }
 
-    // Map the server data to our app's format
-    const realUser = {
-      id: data.user.steamid,
-      username: data.user.personaname,
-      avatar: data.user.avatarfull,
-      level: "??", // Steam requires a different API call for level, skipping for now
-      status: data.user.personastate === 1 ? 'online' : 'offline',
-      gamesOwned: data.games.map(g => ({
-          id: g.appid,
-          title: g.name,
-          playtime: Math.round(g.playtime_forever / 60),
-          genre: "Unknown", // Genre data requires complex extra steps
-          price: "???" 
-      })),
-      wishlist: [] 
-    };
+    // 3. CALL SERVER
+    try {
+      const response = await fetch(`http://localhost:5000/api/search/${activeQuery}`);
+      const data = await response.json();
 
-    setUserData(realUser);
-  } catch (err) {
-    console.error(err);
-    setError("Could not find user. Make sure the profile is Public!");
-  } finally {
-    setLoading(false);
-  }
+      if (!response.ok) throw new Error(data.error || 'Failed to fetch data');
+
+      // Sort Wishlist: Recently Added First (Descending order of dateAdded)
+      const sortedWishlist = (data.wishlist || []).sort((a, b) => b.dateAdded - a.dateAdded);
+
+      const realUser = {
+        id: data.user.steamid,
+        username: data.user.personaname,
+        avatar: data.user.avatarfull,
+        level: "??", 
+        status: data.user.personastate === 1 ? 'online' : 'offline',
+        gamesOwned: data.games.map(g => ({
+            id: g.appid,
+            title: g.name,
+            playtime: Math.round(g.playtime_forever / 60),
+            genre: "Unknown", 
+            // We'll use a placeholder image from Steam's CDN
+            image: `https://steamcdn-a.akamaihd.net/steam/apps/${g.appid}/header.jpg`
+        })),
+        wishlist: sortedWishlist
+      };
+
+      setUserData(realUser);
+    } catch (err) {
+      console.error(err);
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   };
-
+  
+  
   const analysis = useMemo(() => {
     if (!userData) return null;
 
-    // 1. Calculate Favorite Genre
-    const genreCounts = {};
+    // 1. Calculate Genre Weights (Normalized)
+    const genrePlaytime = {};
+    let totalPlaytime = 0;
+
     userData.gamesOwned.forEach(game => {
-      genreCounts[game.genre] = (genreCounts[game.genre] || 0) + game.playtime;
+      // Since real API doesn't give genre easily, we simulate it for the "Unknown" ones
+      // In a real production app, you'd have a separate database for this.
+      // For now, we will assume the mock database genres if matches, or "General"
+      const mockMatch = MOCK_GAME_DATABASE.find(m => m.title === game.title);
+      const genre = mockMatch ? mockMatch.genre : "General"; 
+      
+      genrePlaytime[genre] = (genrePlaytime[genre] || 0) + game.playtime;
+      totalPlaytime += game.playtime;
     });
-    const favoriteGenre = Object.keys(genreCounts).reduce((a, b) => genreCounts[a] > genreCounts[b] ? a : b);
 
-    // 2. Total Playtime
-    const totalPlaytime = userData.gamesOwned.reduce((acc, curr) => acc + curr.playtime, 0);
+    // Normalize: Create a score from 0.0 to 1.0 for each genre
+    // Example: If I play RPGs for 80 hours out of 100 total, my RPG weight is 0.8
+    const genreWeights = {};
+    Object.keys(genrePlaytime).forEach(genre => {
+      genreWeights[genre] = totalPlaytime > 0 ? (genrePlaytime[genre] / totalPlaytime) : 0;
+    });
 
-    // 3. Generate Recommendations
+    const favoriteGenre = Object.keys(genrePlaytime).reduce((a, b) => genrePlaytime[a] > genrePlaytime[b] ? a : b, "General");
+
+    // 2. Generate Recommendations with Weighted Scores
     const ownedIds = new Set(userData.gamesOwned.map(g => g.id));
     
-    // Strategy A: Wishlist (Highest Priority)
-    const wishlistRecs = userData.wishlist.map(w => ({
-      game: w,
-      reason: "It's at the top of their wishlist! You can't go wrong here.",
-      score: 99,
-      type: "Wishlist"
+    // Strategy A: Wishlist (High Score)
+    const wishlistRecs = userData.wishlist.slice(0, 3).map(w => ({
+      game: { ...w, genre: "Wishlist" }, // Pass the wishlist object format
+      reason: `They added this to their wishlist on ${new Date(w.dateAdded * 1000).toLocaleDateString()}. Recent interest!`,
+      score: 100, // Always top priority
+      type: "Wishlist",
+      link: `https://store.steampowered.com/app/${w.id}`
     }));
 
-    // Strategy B: Genre Match (Find high rated games in favorite genre they don't own)
+    // Strategy B: Weighted Discovery
     const genreRecs = MOCK_GAME_DATABASE
-      .filter(g => g.genre === favoriteGenre && !ownedIds.has(g.id))
-      .map(g => ({
-        game: g,
-        reason: `They have played ${Math.floor(genreCounts[favoriteGenre])} hours of ${favoriteGenre} games. ${g.title} is a top-rated title in this genre.`,
-        score: 85 + (g.rating / 10), // Algorithm score
-        type: "Discovery"
-      }));
+      .filter(g => !ownedIds.has(g.id))
+      .map(g => {
+        const affinity = genreWeights[g.genre] || 0.1; // Default low affinity
+        // Score = (Game Rating * 0.4) + (User Affinity * 60)
+        // This balances "Good Game" vs "Genre they actually play"
+        const weightedScore = (g.rating * 0.4) + (affinity * 100 * 0.6);
+        
+        return {
+          game: g,
+          reason: `Calculated affinity: ${(affinity * 100).toFixed(0)}%. This matches their playstyle behavior.`,
+          score: weightedScore,
+          type: "Smart Match",
+          link: `https://store.steampowered.com/app/${g.id}` // Link fix
+        };
+      });
 
-    // Strategy C: Trending/Popular (Fallback)
-    const trendingRecs = MOCK_GAME_DATABASE
-      .filter(g => !ownedIds.has(g.id) && g.rating > 95 && g.genre !== favoriteGenre)
-      .slice(0, 1)
-      .map(g => ({
-        game: g,
-        reason: `${g.title} is a masterpiece rated ${g.rating}%. Even though it's not their main genre, it's a must-play.`,
-        score: 75,
-        type: "Trending"
-      }));
-
-    const allRecommendations = [...wishlistRecs, ...genreRecs, ...trendingRecs].sort((a, b) => b.score - a.score);
+    const allRecommendations = [...wishlistRecs, ...genreRecs].sort((a, b) => b.score - a.score);
 
     return {
       favoriteGenre,
       totalPlaytime,
-      recommendations: allRecommendations.slice(0, 3) // Top 3
+      recommendations: allRecommendations.slice(0, 3)
     };
   }, [userData]);
 
@@ -341,7 +375,10 @@ const App = () => {
               {['StrategyPro', 'FpsKing', 'CozyGamer'].map(user => (
                 <button 
                   key={user}
-                  onClick={() => { setSearchQuery(user); handleSearch({ preventDefault: () => {} }); }}
+                  onClick={() => { 
+                    setSearchQuery(user); // Update the input box visually
+                    handleSearch(null, user); // Run the search immediately with the value
+                  }}
                   className="text-blue-400 hover:text-blue-300 hover:underline cursor-pointer"
                 >
                   {user}
@@ -467,7 +504,8 @@ const App = () => {
                       title={`Recommendation #${idx + 1}: ${rec.type}`}
                       reason={rec.reason}
                       game={rec.game}
-                      matchScore={rec.score}
+                      matchScore={rec.score.toFixed(0)} // Round the score
+                      link={rec.link} // Pass the link!
                     />
                   ))}
                 </div>
